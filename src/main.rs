@@ -6,14 +6,17 @@ use crabgrab::{
 };
 
 use ffmpeg_next::{
-    self as ffmpeg, codec, encoder, log,
+    self as ffmpeg, codec, encoder,
     format::{self, context::Output},
-    frame, Dictionary, Packet, Rational,
+    frame, log, Dictionary, Packet, Rational,
 };
 
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        mpsc::{self},
+        Mutex,
+    },
     task::JoinHandle,
     time::{self, Duration},
 };
@@ -21,164 +24,153 @@ use tokio::{
 use std::{
     io::{self, Write},
     slice,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::Arc,
 };
 
 use chrono::Local;
 
 const DEFAULT_X264_OPTS: &str = "preset=medium";
 
-struct CustomEncoder {
-    encoder: encoder::Video,
+struct SharedRecorder {
     input_time_base: Rational,
-    frame_count: usize,
+    output_time_base: Rational,
+    encoder: Arc<Mutex<encoder::Video>>,
+    output_context: Arc<Mutex<Output>>,
 }
 
-impl CustomEncoder {
-    fn new(
-        octx: &mut Output,
-        x264_opts: Dictionary,
+impl SharedRecorder {
+    async fn receive_and_process_encoded_packets(&self) {
+        let mut encoded = Packet::empty();
+        while self
+            .encoder
+            .lock()
+            .await
+            .receive_packet(&mut encoded)
+            .is_ok()
+        {
+            encoded.rescale_ts(self.input_time_base, self.output_time_base);
+            let mut octx_value = self.output_context.lock().await;
+            encoded.write_interleaved(&mut octx_value).expect("Failed to write packet");
+        }
+    }
+}
+
+struct Recorder {
+    shared: Arc<Mutex<SharedRecorder>>,
+    config: CaptureConfig,
+    token: CaptureAccessToken,
+    output_path: String,
+    frame_count: Arc<Mutex<usize>>,
+}
+
+impl Recorder {
+    async fn new(
         width: f64,
         height: f64,
-        framerate: i32,
+        frame_rate: i32,
+        config: CaptureConfig,
+        token: CaptureAccessToken,
     ) -> Result<Self, ffmpeg::Error> {
-        let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
+        let now = Local::now();
+        let time_string = now.format("%Y-%m-%d_%H-%M-%S").to_string();
+        let output_path = format!("Screen_recording_{}.mp4", time_string);
+        // let output_path = String::from("output.mp4");
+
+        let output_context_arc = Arc::new(Mutex::new(format::output(&output_path).expect("Failed to create output context"))) ;
+        let mut output_context = output_context_arc.lock().await;
 
         let codec = encoder::find(codec::Id::H264);
-        let mut ost = octx.add_stream(codec)?;
 
-        let mut encoder =
-            codec::context::Context::new_with_codec(codec.ok_or(ffmpeg::Error::InvalidData)?)
-                .encoder()
-                .video()?;
-        ost.set_parameters(&encoder);
+        let mut encoder = codec::context::Context::new_with_codec(
+            codec.ok_or(ffmpeg::Error::InvalidData).expect("Codec not found"),
+        )
+        .encoder()
+        .video()
+        .expect("Failed to get video encoder");
         encoder.set_width(width as u32);
         encoder.set_height(height as u32);
         encoder.set_format(format::Pixel::YUV420P);
-        encoder.set_time_base(Rational::new(1, framerate * 100));
+        encoder.set_time_base(Rational::new(1, frame_rate * 100));
 
+        let global_header = output_context
+            .format()
+            .flags()
+            .contains(format::Flags::GLOBAL_HEADER);
         if global_header {
             encoder.set_flags(codec::Flags::GLOBAL_HEADER);
         }
 
-        let opened_encoder = encoder
-            .open_with(x264_opts)
-            .expect("error opening x264 with supplied settings");
-        ost.set_parameters(&opened_encoder);
+        let mut output_stream = output_context.add_stream(codec)?;
+        output_stream.set_parameters(&encoder);
+
+        let x264_opts =
+            parse_opts(DEFAULT_X264_OPTS.to_string()).expect("Failed to parse x264_opts");
+        let opened_encoder = Arc::new(Mutex::new(
+            encoder
+                .open_with(x264_opts)
+                .expect("error opening x264 with supplied settings"),
+        ));
+        output_stream.set_parameters(&*opened_encoder.lock().await);
+
+        format::context::output::dump(&output_context, 0, Some(&output_path));
+        output_context.write_header().expect("Failed to write header");
+
+        let output_time_base = output_context.stream(0).expect("Failed to get output stream").time_base();
 
         Ok(Self {
-            encoder: opened_encoder,
-            input_time_base: Rational::new(1, framerate * 100),
-            frame_count: 0,
+            shared: Arc::new(Mutex::new(SharedRecorder {
+                input_time_base: Rational::new(1, frame_rate * 100),
+                output_time_base,
+                encoder: opened_encoder.clone(),
+                output_context: output_context_arc.clone(),
+            })),
+            config,
+            token,
+            output_path,
+            frame_count: Arc::new(Mutex::new(0)),
         })
     }
 
-    fn fill_ffmpeg_frame<Y, UV>(
-        &mut self,
-        luma_data: &Y,    // Y (Luma) plane data
-        chroma_data: &UV, // UV (Chroma) plane data
-        width: usize,
-        height: usize,
-    ) -> Result<frame::Video, Box<dyn std::error::Error>>
-    where
-        Y: BitmapDataLuma,
-        UV: BitmapDataChroma,
-    {
-        let luma = luma_data.as_ref();
-        let chroma = chroma_data.as_ref();
+    async fn record_frame(&self, tasks: &mut Vec<JoinHandle<()>>) {
+        let token = self.token.clone();
+        let config = self.config.clone();
 
-        // Validate input data size
-        let luma_size = width * height; // Y plane size
-        let chroma_size = (width / 2) * (height / 2); // Each of U and V (for YUV420)
+        let frame_count_arc = self.frame_count.clone();
 
-        if luma.len() != luma_size || chroma.len() != chroma_size {
-            return Err("Input data size does not match dimensions".into());
-        }
+        let shared_arc = self.shared.clone();
 
-        // Create frame
-        let mut frame = frame::Video::new(
-            format::Pixel::YUV420P,
-            width.try_into()?,
-            height.try_into()?,
-        );
+        let handle = tokio::spawn(async move {
+            match crabgrab::feature::screenshot::take_screenshot(token, config).await {
+                Ok(frame) => {
+                    if let Ok(FrameBitmap::YCbCr(bitmap)) = frame.get_bitmap() {
+                        let mut frame = encode_bitmap(bitmap);
+                        let mut frame_count_value = frame_count_arc.lock().await;
+                        let timestamp = (*frame_count_value * 100) as i64;
+                        frame.set_pts(Some(timestamp));
 
-        unsafe {
-            let data = [
-                slice::from_raw_parts_mut(frame.data_mut(0).as_mut_ptr(), frame.data_mut(0).len()),
-                slice::from_raw_parts_mut(frame.data_mut(1).as_mut_ptr(), frame.data_mut(1).len()),
-                slice::from_raw_parts_mut(frame.data_mut(2).as_mut_ptr(), frame.data_mut(2).len()),
-            ];
-            let linesize: [usize; 3] = [frame.stride(0), frame.stride(1), frame.stride(2)];
+                        *frame_count_value += 1;
 
-            // Fill Luma (Y) plane
-            let y_stride = linesize[0] as usize;
-            for row in 0..height {
-                let src_start = row * width;
-                let dest_start = row * y_stride;
-                data[0][dest_start..dest_start + width]
-                    .copy_from_slice(&luma[src_start..src_start + width]);
-            }
+                        let shared = shared_arc.lock().await;
 
-            // Fill Chroma (CbCr) planes (interleaved as UVUV...)
-            let uv_stride = linesize[1] as usize;
-            for row in 0..(height / 2) {
-                let src_start = row * (width / 2);
-                let dest_start = row * uv_stride;
-                for col in 0..(width / 2) {
-                    if dest_start + col >= data[1].len() || dest_start + col >= data[2].len() {
-                        panic!("Index out of bounds: dest_start + col exceeds buffer size");
+                        shared.encoder.lock().await.send_frame(&frame).expect("Failed to send frame");
+                        shared.receive_and_process_encoded_packets().await;
                     }
-
-                    let cb = chroma[src_start + col][0];
-                    let cr = chroma[src_start + col][1];
-
-                    data[1][dest_start + col] = cb;
-                    data[2][dest_start + col] = cr;
                 }
+                Err(_) => println!("Screenshot failed!"),
             }
-        }
+        });
 
-        Ok(frame)
+        tasks.push(handle);
     }
 
-    fn receive_and_process_decoded_frames(
-        &mut self,
-        octx: &mut Output,
-        bitmap: FrameBitmapYCbCr<Box<[u8]>, Box<[[u8; 2]]>>,
-        ost_time_base: Rational,
-    ) {
-        let mut input_frame = self
-            .fill_ffmpeg_frame(
-                &bitmap.luma_data,
-                &bitmap.chroma_data,
-                bitmap.luma_width,
-                bitmap.luma_height,
-            )
-            .unwrap();
+    async fn stop_recording(&self) {
+        let shared = self.shared.lock().await;
+        shared.encoder.lock().await.send_eof().expect("Failed to send EOF");
+        shared.receive_and_process_encoded_packets().await;
 
-        let timestamp = (self.frame_count * 100) as i64;
-        input_frame.set_pts(Some(timestamp));
+        shared.output_context.lock().await.write_trailer().expect("Failed to write trailer");
 
-        self.frame_count += 1;
-
-        self.send_frame_to_encoder(&input_frame);
-        self.receive_and_process_encoded_packets(octx, ost_time_base);
-    }
-
-    fn send_frame_to_encoder(&mut self, frame: &frame::Video) {
-        self.encoder.send_frame(frame).unwrap();
-    }
-
-    fn send_eof_to_encoder(&mut self) {
-        self.encoder.send_eof().unwrap();
-    }
-
-    fn receive_and_process_encoded_packets(&mut self, octx: &mut Output, ost_time_base: Rational) {
-        let mut encoded = Packet::empty();
-        while self.encoder.receive_packet(&mut encoded).is_ok() {
-            encoded.rescale_ts(self.input_time_base, ost_time_base);
-            encoded.write_interleaved(octx).unwrap();
-        }
+        println!("Recording saved to {}", self.output_path);
     }
 }
 
@@ -194,97 +186,99 @@ fn parse_opts<'a>(s: String) -> Option<Dictionary<'a>> {
     Some(dict)
 }
 
-async fn capture_frame(
-    token: CaptureAccessToken,
-    config: CaptureConfig,
-    encoder: Arc<Mutex<CustomEncoder>>,
-    octx: Arc<Mutex<Output>>,
-    ost_time_base: Rational,
-) {
-    match crabgrab::feature::screenshot::take_screenshot(token, config).await {
-        Ok(frame) => {
-            if let Ok(FrameBitmap::YCbCr(bitmap)) = frame.get_bitmap() {
-                encoder.lock().unwrap().receive_and_process_decoded_frames(
-                    &mut octx.lock().unwrap(),
-                    bitmap,
-                    ost_time_base,
-                );
-            }
-        }
-        Err(_) => println!("screenshot failed!"),
-    }
+fn encode_bitmap(bitmap: FrameBitmapYCbCr<Box<[u8]>, Box<[[u8; 2]]>>) -> frame::Video {
+    fill_ffmpeg_frame(
+        &bitmap.luma_data,
+        &bitmap.chroma_data,
+        bitmap.luma_width,
+        bitmap.luma_height,
+    )
+    .expect("Failed to fill ffmpeg frame")
 }
 
-async fn record_task<'a>(
-    rx: Arc<tokio::sync::Mutex<Receiver<&'a str>>>,
-    encoder: Arc<Mutex<CustomEncoder>>,
-    octx: Arc<Mutex<Output>>,
-    ost_time_base: Rational,
-    output_path: &'a str,
-    interval: Duration,
-    config: CaptureConfig,
-    token: CaptureAccessToken,
-) {
-    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-    let mut ticker = time::interval(interval);
+fn fill_ffmpeg_frame<Y, UV>(
+    luma_data: &Y,    // Y (Luma) plane data
+    chroma_data: &UV, // UV (Chroma) plane data
+    width: usize,
+    height: usize,
+) -> Result<frame::Video, Box<dyn std::error::Error>>
+where
+    Y: BitmapDataLuma,
+    UV: BitmapDataChroma,
+{
+    let luma = luma_data.as_ref();
+    let chroma = chroma_data.as_ref();
 
-    println!("Recording entire screen");
+    // Validate input data size
+    let luma_size = width * height; // Y plane size
+    let chroma_size = (width / 2) * (height / 2); // Each of U and V (for YUV420)
 
-    loop {
-        if let Ok(command) = rx.lock().await.try_recv() {
-            match command {
-                "stop" => {
-                    println!("Stopping recording");
+    if luma.len() != luma_size || chroma.len() != chroma_size {
+        return Err("Input data size does not match dimensions".into());
+    }
 
-                    for task in tasks.drain(..) {
-                        task.await.unwrap();
-                    }
+    // Create frame
+    let mut frame = frame::Video::new(
+        format::Pixel::YUV420P,
+        width.try_into()?,
+        height.try_into()?,
+    );
 
-                    encoder.lock().unwrap().send_eof_to_encoder();
-                    encoder.lock().unwrap().receive_and_process_encoded_packets(
-                        &mut octx.lock().unwrap(),
-                        ost_time_base,
-                    );
+    unsafe {
+        let data = [
+            slice::from_raw_parts_mut(frame.data_mut(0).as_mut_ptr(), frame.data_mut(0).len()),
+            slice::from_raw_parts_mut(frame.data_mut(1).as_mut_ptr(), frame.data_mut(1).len()),
+            slice::from_raw_parts_mut(frame.data_mut(2).as_mut_ptr(), frame.data_mut(2).len()),
+        ];
+        let linesize: [usize; 3] = [frame.stride(0), frame.stride(1), frame.stride(2)];
 
-                    octx.lock().unwrap().write_trailer().unwrap();
-
-                    println!("Recording saved to {}", output_path);
-                }
-                "break" => {
-                    println!("Breaking");
-                    break;
-                }
-                _ => {
-                    println!("Unknown command: {}. Try 'help'", command);
-                }
-            }
+        // Fill Luma (Y) plane
+        let y_stride = linesize[0] as usize;
+        for row in 0..height {
+            let src_start = row * width;
+            let dest_start = row * y_stride;
+            data[0][dest_start..dest_start + width]
+                .copy_from_slice(&luma[src_start..src_start + width]);
         }
 
-        ticker.tick().await;
-        println!("Recording frame");
+        // Fill Chroma (CbCr) planes (interleaved as UVUV...)
+        let uv_stride = linesize[1] as usize;
+        for row in 0..(height / 2) {
+            let src_start = row * (width / 2);
+            let dest_start = row * uv_stride;
+            for col in 0..(width / 2) {
+                if dest_start + col >= data[1].len() || dest_start + col >= data[2].len() {
+                    panic!("Index out of bounds: dest_start + col exceeds buffer size");
+                }
 
-        let copied_config = config.clone();
-        let copied_cencoder = Arc::clone(&encoder);
-        let copied_octx = Arc::clone(&octx);
+                let cb = chroma[src_start + col][0];
+                let cr = chroma[src_start + col][1];
 
-        let handle = tokio::spawn(async move {
-            capture_frame(
-                token,
-                copied_config,
-                copied_cencoder,
-                copied_octx,
-                ost_time_base,
-            )
-            .await;
-        });
-
-        tasks.push(handle);
+                data[1][dest_start + col] = cb;
+                data[2][dest_start + col] = cr;
+            }
+        }
     }
+
+    Ok(frame)
+}
+
+fn print_help() {
+    println!("Available commands:");
+    println!("s - record entire screen");
+    println!("q - stop recording");
+    println!("exit - exit");
+}
+
+enum Command {
+    Start,
+    Stop,
+    Exit,
 }
 
 #[tokio::main]
 async fn main() {
-    ffmpeg::init().unwrap();
+    ffmpeg::init().expect("Failed to initialize ffmpeg");
     log::set_level(log::Level::Error);
 
     let token = match CaptureStream::test_access(false) {
@@ -294,92 +288,62 @@ async fn main() {
             .expect("Expected capture access"),
     };
     let filter = CapturableContentFilter::DISPLAYS;
-    let content = CapturableContent::new(filter).await.unwrap();
+    let content = CapturableContent::new(filter).await.expect("Failed to get content");
     let config =
-        CaptureConfig::with_display(content.displays().next().unwrap(), CapturePixelFormat::V420);
+        CaptureConfig::with_display(content.displays().next().expect("Expected at least one display"), CapturePixelFormat::V420);
 
-    let now = Local::now();
-    let time_string = now.format("%Y-%m-%d_%H-%M-%S").to_string();
-    let output_path = format!("Screen_recording_{}.mp4", time_string);
-
-    let octx = Arc::new(Mutex::new(format::output(&output_path).unwrap()));
-
-    let x264_opts = parse_opts(DEFAULT_X264_OPTS.to_string()).expect("Failed to parse x264_opts");
-
-    let screen = content.displays().next().unwrap();
+    let screen = content.displays().next().expect("Expected at least one display");
     let width = screen.rect().size.width;
     let height = screen.rect().size.height;
 
     let frame_rate = 30;
 
-    let encoder = Arc::new(Mutex::new(
-        CustomEncoder::new(
-            &mut octx.lock().unwrap(),
-            x264_opts.to_owned(),
-            width,
-            height,
-            frame_rate,
-        )
-        .unwrap(),
-    ));
+    let (tx, mut rx) = mpsc::channel(100);
 
-    format::context::output::dump(&mut octx.lock().unwrap(), 0, Some(&output_path));
-    octx.lock().unwrap().write_header().unwrap();
-
-    let ost_time_base = octx.lock().unwrap().stream(0).unwrap().time_base();
-
-    let interval = Duration::from_secs_f64(1.0 / frame_rate as f64);
-
-    let (tx, mut rx) = mpsc::channel(32);
-
-    let is_recording = Arc::new(AtomicBool::new(false));
-    let is_recording_clone = Arc::clone(&is_recording);
+    print_help();
 
     let input_thread = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
         let mut stdin = BufReader::new(stdin);
         let mut line = String::new();
+        let mut is_recording = false;
 
         loop {
             line.clear();
             print!("> ");
-            io::stdout().flush().unwrap();
+            io::stdout().flush().expect("Failed to flush stdout");
 
             match stdin.read_line(&mut line).await {
                 Ok(_) => {
                     let input = line.trim();
                     match input {
                         "help" => {
-                            println!("Available commands:");
-                            println!("s - record entire screen");
-                            println!("q - stop recording");
-                            println!("exit - exit");
+                            print_help();
                         }
                         "s" => {
-                            println!("Starting recording...");
-                            println!("Enter q to stop");
-                            if is_recording_clone.load(Ordering::SeqCst) {
+                            if is_recording {
                                 println!("Already recording");
                                 continue;
                             }
-                            is_recording_clone.store(true, Ordering::SeqCst);
-                            tx.send("start").await.unwrap();
+                            println!("Recording started. Enter 'q' to stop");
+                            is_recording = true;
+                            tx.send(Command::Start).await.expect("Failed to send command start");
                         }
                         "q" => {
-                            if !is_recording_clone.load(Ordering::SeqCst) {
+                            if !is_recording {
                                 println!("Not recording");
                                 continue;
                             }
-                            println!("Stopping recording...");
-                            tx.send("stop").await.unwrap();
+                            println!("Stopping recording... close the app if it takes more than a few seconds");
+                            tx.send(Command::Stop).await.expect("Failed to send command stop");
                             break;
                         }
                         "exit" => {
-                            tx.send("break").await.unwrap();
+                            tx.send(Command::Exit).await.expect("Failed to send command exit");
                             break;
                         }
                         _ => {
-                            println!("Unknown command: {}. Try 'help'", input);
+                            println!("Unknown command. Try 'help'");
                         }
                     }
                 }
@@ -391,66 +355,52 @@ async fn main() {
         }
     });
 
-    let recording_thread = tokio::spawn(async move {
-        let mut is_recording = false;
-        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-        let mut ticker = time::interval(interval);
+    let mut is_recording = false;
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
-        loop {
-            if let Ok(command) = rx.try_recv() {
-                match command {
-                    "start" => {
-                        if !is_recording {
-                            is_recording = true;
-                        }
-                    }
-                    "stop" => {
-                        for task in tasks.drain(..) {
-                            task.await.unwrap();
-                        }
+    let interval = Duration::from_secs_f64(1.0 / frame_rate as f64);
+    let mut ticker = time::interval(interval);
 
-                        encoder.lock().unwrap().send_eof_to_encoder();
-                        encoder.lock().unwrap().receive_and_process_encoded_packets(
-                            &mut octx.lock().unwrap(),
-                            ost_time_base,
+    let mut recorder: Option<Recorder> = None;
+
+    loop {
+        if let Ok(command) = rx.try_recv() {
+            match command {
+                Command::Start => {
+                    if !is_recording {
+                        is_recording = true;
+                        recorder = Some(
+                            Recorder::new(width, height, frame_rate, config.clone(), token)
+                                .await
+                                .expect("Failed to create recorder"),
                         );
-
-                        octx.lock().unwrap().write_trailer().unwrap();
-
-                        println!("Recording saved to {}", output_path);
-                        break;
-                    }
-                    "break" => {
-                        break;
-                    }
-                    _ => {
-                        println!("Unknown command: {}. Try 'help'", command);
                     }
                 }
-            }
-
-            if is_recording {
-                ticker.tick().await;
-
-                let copied_config = config.clone();
-                let copied_cencoder = Arc::clone(&encoder);
-                let copied_octx = Arc::clone(&octx);
-
-                let handle = tokio::spawn(async move {
-                    capture_frame(
-                        token,
-                        copied_config,
-                        copied_cencoder,
-                        copied_octx,
-                        ost_time_base,
-                    )
-                    .await;
-                });
-
-                tasks.push(handle);
+                Command::Stop => {
+                    if let Some(rec) = &recorder {
+                        for task in tasks.drain(..) {
+                            task.await.expect("Failed to stop recording");
+                        }
+                        rec.stop_recording().await;
+                        break;
+                    }
+                }
+                Command::Exit => {
+                    for task in tasks.drain(..) {
+                        task.await.expect("Failed to stop recording");
+                    }
+                    break;
+                }
             }
         }
-    });
 
-    let _ = tokio::join!(input_thread, recording_thread);
+        if is_recording {
+            if let Some(rec) = &recorder {
+                ticker.tick().await;
+                rec.record_frame(&mut tasks).await;
+            }
+        }
+    }
+
+    input_thread.await.expect("Failed to join input thread");
 }
